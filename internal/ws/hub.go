@@ -123,7 +123,6 @@ func (h *Hub) Run() {
 					continue
 				}
 
-				// Серверное время
 				msg.Timestamp = time.Now().Unix()
 
 				targetChatID = msg.ChatID

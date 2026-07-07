@@ -10,6 +10,7 @@ type User struct {
 	PasswordHash        string `json:"-"`
 	PublicKey           string `json:"public_key"`
 	EncryptedPrivateKey string `json:"encrypted_private_key"`
+	Avatar              string `json:"avatar"`
 }
 
 type Chat struct {

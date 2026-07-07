@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -11,13 +10,14 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/sourcels/LightyContact/internal/middleware"
 	"github.com/sourcels/LightyContact/internal/models"
+	"github.com/sourcels/LightyContact/internal/repository"
 	"github.com/sourcels/LightyContact/internal/utils"
+	"github.com/sourcels/LightyContact/internal/ws"
 )
 
 type ChatHandler struct {
-	DB *sql.DB
+	Repo *repository.ChatRepo
 }
 
 type CreateChatRequest struct {
@@ -37,20 +37,19 @@ func generateFileID() string {
 }
 
 func (h *ChatHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+	if !utils.CheckMethod(w, r, http.MethodPost) {
 		return
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 50<<20)
 	if err := r.ParseMultipartForm(50 << 20); err != nil {
-		http.Error(w, "Файл слишком большой или ошибка формата", http.StatusBadRequest)
+		utils.SendError(w, http.StatusBadRequest, "File is too large or format error")
 		return
 	}
 
 	file, _, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "Файл не найден в запросе", http.StatusBadRequest)
+		utils.SendError(w, http.StatusBadRequest, "File not found in request")
 		return
 	}
 	defer file.Close()
@@ -62,40 +61,38 @@ func (h *ChatHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	filePath := filepath.Join(uploadDir, fileID)
 	dst, err := os.Create(filePath)
 	if err != nil {
-		http.Error(w, "Ошибка сохранения файла", http.StatusInternalServerError)
+		utils.SendError(w, http.StatusInternalServerError, "Error saving file")
 		return
 	}
 	defer dst.Close()
 
 	if _, err := io.Copy(dst, file); err != nil {
-		http.Error(w, "Ошибка записи файла", http.StatusInternalServerError)
+		utils.SendError(w, http.StatusInternalServerError, "Error writing file")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"file_id": fileID})
+	utils.SendJSON(w, http.StatusOK, map[string]string{"file_id": fileID})
 }
 
 func (h *ChatHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+	if !utils.CheckMethod(w, r, http.MethodGet) {
 		return
 	}
 
 	fileID := r.URL.Query().Get("file_id")
 	if fileID == "" {
-		http.Error(w, "file_id обязателен", http.StatusBadRequest)
+		utils.SendError(w, http.StatusBadRequest, "file_id is required")
 		return
 	}
 
 	if filepath.Base(fileID) != fileID {
-		http.Error(w, "Неверный file_id", http.StatusBadRequest)
+		utils.SendError(w, http.StatusBadRequest, "Invalid file_id")
 		return
 	}
 
 	filePath := filepath.Join("uploads", fileID)
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		http.Error(w, "Файл не найден", http.StatusNotFound)
+		utils.SendError(w, http.StatusNotFound, "File not found")
 		return
 	}
 
@@ -118,82 +115,48 @@ func (h *ChatHandler) CreateChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.ChatID == "" || len(req.Members) == 0 {
-		utils.SendError(w, http.StatusBadRequest, "chat_id и список members обязательны")
+		utils.SendError(w, http.StatusBadRequest, "chat_id and members are required")
 		return
 	}
 
 	if req.Type != "direct" && req.Type != "group" {
-		utils.SendError(w, http.StatusBadRequest, "Неверный тип чата")
+		utils.SendError(w, http.StatusBadRequest, "Invalid chat type")
 		return
 	}
 
-	isRoot := userID == "_root"
+	membersInput := make([]repository.ChatMemberInput, 0, len(req.Members))
+
 	for _, member := range req.Members {
-		if (member.UserID == "_root" || member.UserID == "system_bot") && !isRoot {
-			utils.SendError(w, http.StatusForbidden, "Forbidden to chat with system accounts")
+		if member.UserID == "system_bot" {
+			utils.SendError(w, http.StatusForbidden, "Forbidden to chat with system accounts directly")
 			return
 		}
+		membersInput = append(membersInput, repository.ChatMemberInput{
+			UserID:           member.UserID,
+			EncryptedChatKey: member.EncryptedChatKey,
+		})
 	}
 
-	if req.Type == "direct" && len(req.Members) == 2 {
-		var targetUserID string
-		for _, m := range req.Members {
-			if m.UserID != userID {
-				targetUserID = m.UserID
-				break
-			}
+	if req.Type == "direct" {
+		if len(req.Members) != 2 {
+			utils.SendError(w, http.StatusBadRequest, "Direct chat must have exactly 2 members")
+			return
 		}
 
-		var existingChatID string
-		checkQuery := `
-			SELECT c.id FROM chats c
-			JOIN chat_members cm1 ON c.id = cm1.chat_id
-			JOIN chat_members cm2 ON c.id = cm2.chat_id
-			WHERE c.type = 'direct' AND cm1.user_id = ? AND cm2.user_id = ?
-		`
-		err := h.DB.QueryRow(checkQuery, userID, targetUserID).Scan(&existingChatID)
+		targetUserID := req.Members[0].UserID
+		if targetUserID == userID {
+			targetUserID = req.Members[1].UserID
+		}
+
+		existingChatID, err := h.Repo.CheckDirectChatExists(userID, targetUserID)
 		if err == nil && existingChatID != "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			w.Write([]byte(`{"error":"Chat with this user already exists", "chat_id":"` + existingChatID + `"}`))
+			utils.SendError(w, http.StatusConflict, "Chat with this user already exists")
 			return
 		}
 	}
 
-	tx, err := h.DB.Begin()
-	if err != nil {
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	chatQuery := `INSERT INTO chats (id, type, name) VALUES (?, ?, ?)`
-	_, err = tx.Exec(chatQuery, req.ChatID, req.Type, req.Name)
-	if err != nil {
-		tx.Rollback()
-		http.Error(w, "Error chat creation", http.StatusInternalServerError)
-		return
-	}
-
-	membersQuery := `INSERT OR IGNORE INTO chat_members (chat_id, user_id, encrypted_chat_key) VALUES (?, ?, ?)`
-	stmt, err := tx.Prepare(membersQuery)
-	if err != nil {
-		tx.Rollback()
-		http.Error(w, "Ошибка подготовки запроса участников", http.StatusInternalServerError)
-		return
-	}
-	defer stmt.Close()
-
-	for _, member := range req.Members {
-		_, err := stmt.Exec(req.ChatID, member.UserID, member.EncryptedChatKey)
-		if err != nil {
-			tx.Rollback()
-			http.Error(w, "Ошибка сохранения участников (возможно, дубликат)", http.StatusConflict)
-			return
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		utils.SendError(w, http.StatusInternalServerError, "Transaction error")
+	if err := h.Repo.CreateChat(req.ChatID, req.Type, req.Name, membersInput); err != nil {
+		utils.SendError(w, http.StatusInternalServerError, "Error chat creation")
 		return
 	}
 
@@ -205,82 +168,48 @@ func (h *ChatHandler) CreateChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ChatHandler) GetUserChats(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+	if !utils.CheckMethod(w, r, http.MethodGet) {
 		return
 	}
 
-	userID, ok := r.Context().Value(middleware.UserIDKey).(string)
+	userID, ok := utils.GetUserID(w, r)
 	if !ok {
-		http.Error(w, "Ошибка авторизации", http.StatusInternalServerError)
 		return
 	}
 
-	query := `
-		SELECT cm.chat_id, cm.encrypted_chat_key, c.type, c.name 
-		FROM chat_members cm
-		JOIN chats c ON cm.chat_id = c.id
-		WHERE cm.user_id = ?
-	`
-	rows, err := h.DB.Query(query, userID)
+	chats, err := h.Repo.GetUserChats(userID)
 	if err != nil {
-		http.Error(w, "Ошибка базы данных", http.StatusInternalServerError)
+		utils.SendError(w, http.StatusInternalServerError, "Database error")
 		return
 	}
-	defer rows.Close()
 
-	var chats []models.ChatResponse
-	for rows.Next() {
-		var chat models.ChatResponse
-		var chatName sql.NullString
-
-		if err := rows.Scan(&chat.ChatID, &chat.EncryptedChatKey, &chat.Type, &chatName); err != nil {
-			continue
-		}
-
-		if chatName.Valid {
-			chat.Name = &chatName.String
-		}
-
-		chats = append(chats, chat)
-	}
-
-	if chats == nil {
-		chats = make([]models.ChatResponse, 0)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(chats)
+	utils.SendJSON(w, http.StatusOK, chats)
 }
 
 func (h *ChatHandler) GetHistory(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+	if !utils.CheckMethod(w, r, http.MethodGet) {
 		return
 	}
 
-	userID, ok := r.Context().Value(middleware.UserIDKey).(string)
+	userID, ok := utils.GetUserID(w, r)
 	if !ok {
-		http.Error(w, "Ошибка авторизации", http.StatusInternalServerError)
 		return
 	}
 
 	chatID := r.URL.Query().Get("chat_id")
 	if chatID == "" {
-		http.Error(w, "chat_id обязателен", http.StatusBadRequest)
+		utils.SendError(w, http.StatusBadRequest, "chat_id is required")
 		return
 	}
 
-	var exists bool
-	err := h.DB.QueryRow(`SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?`, chatID, userID).Scan(&exists)
-	if err != nil || !exists {
-		http.Error(w, "Доступ запрещен: вы не участник этого чата", http.StatusForbidden)
+	isMember, err := h.Repo.IsChatMember(chatID, userID)
+	if err != nil || !isMember {
+		utils.SendError(w, http.StatusForbidden, "Access denied")
 		return
 	}
 
-	limitStr := r.URL.Query().Get("limit")
 	limit := 20
-	if limitStr != "" {
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
 			if parsedLimit > 100 {
 				limit = 100
@@ -290,134 +219,162 @@ func (h *ChatHandler) GetHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	beforeStr := r.URL.Query().Get("before")
-	afterStr := r.URL.Query().Get("after")
+	var beforeTimestamp, afterTimestamp int64
 
-	var query string
-	var rows *sql.Rows
-	var errQuery error
-
-	if afterStr != "" {
-		afterTimestamp, err := strconv.ParseInt(afterStr, 10, 64)
-		if err != nil {
-			http.Error(w, "Неверный формат параметра after", http.StatusBadRequest)
-			return
-		}
-
-		query = `
-			SELECT message_id, chat_id, sender_id, sender_type, chat_type, timestamp, content, iv, file_id 
-			FROM messages 
-			WHERE chat_id = ? AND timestamp > ? 
-			ORDER BY timestamp ASC 
-			LIMIT ?
-		`
-		rows, errQuery = h.DB.Query(query, chatID, afterTimestamp, limit)
-
-	} else if beforeStr != "" {
-		beforeTimestamp, err := strconv.ParseInt(beforeStr, 10, 64)
-		if err != nil {
-			http.Error(w, "Неверный формат параметра before", http.StatusBadRequest)
-			return
-		}
-
-		query = `
-			SELECT message_id, chat_id, sender_id, sender_type, chat_type, timestamp, content, iv, file_id 
-			FROM messages 
-			WHERE chat_id = ? AND timestamp < ? 
-			ORDER BY timestamp DESC 
-			LIMIT ?
-		`
-		rows, errQuery = h.DB.Query(query, chatID, beforeTimestamp, limit)
-
-	} else {
-		query = `
-			SELECT message_id, chat_id, sender_id, sender_type, chat_type, timestamp, content, iv, file_id 
-			FROM messages
-			WHERE chat_id = ?
-			ORDER BY timestamp DESC
-			LIMIT ?
-		`
-		rows, errQuery = h.DB.Query(query, chatID, limit)
+	if beforeStr := r.URL.Query().Get("before"); beforeStr != "" {
+		beforeTimestamp, _ = strconv.ParseInt(beforeStr, 10, 64)
+	}
+	if afterStr := r.URL.Query().Get("after"); afterStr != "" {
+		afterTimestamp, _ = strconv.ParseInt(afterStr, 10, 64)
 	}
 
-	if errQuery != nil {
-		http.Error(w, "Error getting messages", http.StatusInternalServerError)
+	messages, err := h.Repo.GetChatHistory(chatID, limit, beforeTimestamp, afterTimestamp)
+	if err != nil {
+		utils.SendError(w, http.StatusInternalServerError, "Error getting messages")
 		return
 	}
-	defer rows.Close()
 
-	messages := make([]models.Message, 0)
-	for rows.Next() {
-		var msg models.Message
-		var fileID sql.NullString
-
-		if err := rows.Scan(
-			&msg.MessageID,
-			&msg.ChatID,
-			&msg.SenderID,
-			&msg.SenderType,
-			&msg.ChatType,
-			&msg.Timestamp,
-			&msg.Content,
-			&msg.IV,
-			&fileID,
-		); err != nil {
-			continue
-		}
-
-		if fileID.Valid {
-			msg.FileID = fileID.String
-		}
-
-		messages = append(messages, msg)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(messages)
+	utils.SendJSON(w, http.StatusOK, messages)
 }
 
 func (h *ChatHandler) GetChatStatuses(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+	if !utils.CheckMethod(w, r, http.MethodGet) {
 		return
 	}
 
-	userID, ok := r.Context().Value(middleware.UserIDKey).(string)
+	userID, ok := utils.GetUserID(w, r)
 	if !ok {
-		http.Error(w, "Ошибка авторизации", http.StatusInternalServerError)
 		return
 	}
 
 	chatID := r.URL.Query().Get("chat_id")
 	if chatID == "" {
-		http.Error(w, "chat_id обязателен", http.StatusBadRequest)
+		utils.SendError(w, http.StatusBadRequest, "chat_id is required")
 		return
 	}
 
-	var exists bool
-	err := h.DB.QueryRow(`SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?`, chatID, userID).Scan(&exists)
-	if err != nil || !exists {
-		http.Error(w, "Доступ запрещен", http.StatusForbidden)
+	isMember, err := h.Repo.IsChatMember(chatID, userID)
+	if err != nil || !isMember {
+		utils.SendError(w, http.StatusForbidden, "Access denied")
 		return
 	}
 
-	query := `SELECT message_id, user_id, status, updated_at FROM message_statuses WHERE chat_id = ?`
-	rows, err := h.DB.Query(query, chatID)
+	statuses, err := h.Repo.GetChatStatuses(chatID)
 	if err != nil {
-		http.Error(w, "Ошибка БД", http.StatusInternalServerError)
+		utils.SendError(w, http.StatusInternalServerError, "DB Error")
 		return
 	}
-	defer rows.Close()
 
-	statuses := make([]models.MessageStatus, 0)
-	for rows.Next() {
-		var s models.MessageStatus
-		s.ChatID = chatID
-		if err := rows.Scan(&s.MessageID, &s.UserID, &s.Status, &s.Timestamp); err == nil {
-			statuses = append(statuses, s)
+	utils.SendJSON(w, http.StatusOK, statuses)
+}
+
+func (h *ChatHandler) DeleteMessage(hub *ws.Hub, w http.ResponseWriter, r *http.Request) {
+	if !utils.CheckMethod(w, r, http.MethodDelete) {
+		return
+	}
+
+	userID, ok := utils.GetUserID(w, r)
+	if !ok {
+		return
+	}
+
+	messageID := r.URL.Query().Get("message_id")
+	chatID := r.URL.Query().Get("chat_id")
+	if messageID == "" || chatID == "" {
+		utils.SendError(w, http.StatusBadRequest, "message_id and chat_id are required")
+		return
+	}
+
+	participants, err := h.Repo.GetChatMemberIDs(chatID)
+	if err != nil {
+		utils.SendError(w, http.StatusInternalServerError, "Failed to fetch chat members")
+		return
+	}
+
+	fileID, err := h.Repo.DeleteMessage(messageID, userID)
+	if err != nil {
+		utils.SendError(w, http.StatusForbidden, "Cannot delete message or message not found")
+		return
+	}
+
+	if fileID != "" {
+		os.Remove(filepath.Join("uploads", fileID))
+	}
+
+	event := models.WSEvent{
+		Type:    "message_deleted",
+		Payload: json.RawMessage(`{"message_id":"` + messageID + `", "chat_id":"` + chatID + `"}`),
+	}
+	eventBytes, _ := json.Marshal(event)
+
+	go func() {
+		hub.Dispatch <- &ws.DispatchMessage{
+			SenderID:     userID,
+			Message:      eventBytes,
+			Participants: participants,
+		}
+	}()
+
+	utils.SendJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (h *ChatHandler) DeleteChat(hub *ws.Hub, w http.ResponseWriter, r *http.Request) {
+	if !utils.CheckMethod(w, r, http.MethodDelete) {
+		return
+	}
+
+	userID, ok := utils.GetUserID(w, r)
+	if !ok {
+		return
+	}
+
+	chatID := r.URL.Query().Get("chat_id")
+	if chatID == "" {
+		utils.SendError(w, http.StatusBadRequest, "chat_id is required")
+		return
+	}
+
+	participants, err := h.Repo.GetChatMemberIDs(chatID)
+	if err != nil {
+		utils.SendError(w, http.StatusInternalServerError, "Failed to fetch chat members")
+		return
+	}
+
+	isMember := false
+	for _, p := range participants {
+		if p == userID {
+			isMember = true
+			break
 		}
 	}
+	if !isMember {
+		utils.SendError(w, http.StatusForbidden, "You are not a member of this chat")
+		return
+	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(statuses)
+	fileIDs, err := h.Repo.DeleteChat(chatID, userID)
+	if err != nil {
+		utils.SendError(w, http.StatusForbidden, "Cannot delete chat or chat not found")
+		return
+	}
+
+	for _, fid := range fileIDs {
+		os.Remove(filepath.Join("uploads", fid))
+	}
+
+	event := models.WSEvent{
+		Type:    "chat_deleted",
+		Payload: json.RawMessage(`{"chat_id":"` + chatID + `"}`),
+	}
+	eventBytes, _ := json.Marshal(event)
+
+	go func() {
+		hub.Dispatch <- &ws.DispatchMessage{
+			SenderID:     userID,
+			Message:      eventBytes,
+			Participants: participants,
+		}
+	}()
+
+	utils.SendJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }

@@ -14,11 +14,9 @@ type Config struct {
 	JWTSecret     string
 	AllowedOrigin string
 	MaxBodySize   int64
-	RootPassword  string
 }
 
 func Load() *Config {
-
 	if err := godotenv.Load(); err != nil {
 		slog.Info(".env file not found, falling back to system environment variables")
 	}
@@ -29,7 +27,6 @@ func Load() *Config {
 		JWTSecret:     getEnv("JWT_SECRET", ""),
 		AllowedOrigin: getEnv("ALLOWED_ORIGIN", "*"),
 		MaxBodySize:   getEnvAsInt64("MAX_BODY_SIZE", 1048576),
-		RootPassword:  getEnv("ROOT_PASSWORD", ""),
 	}
 }
 

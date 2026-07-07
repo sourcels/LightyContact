@@ -2,21 +2,22 @@ package handlers
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/sourcels/LightyContact/internal/auth"
-	"github.com/sourcels/LightyContact/internal/middleware"
 	"github.com/sourcels/LightyContact/internal/models"
+	"github.com/sourcels/LightyContact/internal/repository"
 	"github.com/sourcels/LightyContact/internal/utils"
 	"golang.org/x/crypto/bcrypt"
 )
 
 type AuthHandler struct {
-	DB *sql.DB
+	Repo *repository.AuthRepo
 }
 
 type RegisterRequest struct {
@@ -40,6 +41,12 @@ type LoginResponse struct {
 	EncryptedPrivateKey string `json:"encrypted_private_key"`
 }
 
+type ChangePasswordRequest struct {
+	OldPassword         string `json:"old_password"`
+	NewPassword         string `json:"new_password"`
+	EncryptedPrivateKey string `json:"encrypted_private_key"`
+}
+
 func generateInviteCode() string {
 	bytes := make([]byte, 16)
 	rand.Read(bytes)
@@ -56,55 +63,57 @@ func (h *AuthHandler) GenerateInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if userID != "_root" {
-		utils.SendError(w, http.StatusForbidden, "You are not allowed to send invites")
+	count, err := h.Repo.GetInviteCountLastWeek(userID)
+	if err != nil {
+		utils.SendError(w, http.StatusInternalServerError, "Database error checking limits")
+		return
+	}
+	if count >= 10 {
+		utils.SendError(w, http.StatusTooManyRequests, "Weekly invite limit reached (max 10 per week)")
 		return
 	}
 
-	code := generateInviteCode()
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		utils.SendError(w, http.StatusInternalServerError, "Internal error")
+		return
+	}
+	code := hex.EncodeToString(bytes)
 	timestamp := time.Now().Unix()
 
-	_, err := h.DB.Exec(`INSERT INTO invites (code, created_by, is_used, created_at) VALUES (?, ?, FALSE, ?)`, code, userID, timestamp)
-	if err != nil {
+	if err := h.Repo.CreateInvite(code, userID, timestamp); err != nil {
 		utils.SendError(w, http.StatusInternalServerError, "Error creating invite")
 		return
 	}
 
 	utils.SendJSON(w, http.StatusCreated, map[string]string{
 		"invite_code": code,
-		"link":        "?invite=" + code,
 	})
 }
 
 func (h *AuthHandler) VerifyInvite(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
+	if !utils.CheckMethod(w, r, http.MethodGet) {
 		return
 	}
 
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		http.Error(w, `{"error": "Code was not sent"}`, http.StatusBadRequest)
+		utils.SendError(w, http.StatusBadRequest, "Code was not sent")
 		return
 	}
 
-	var isUsed bool
-	err := h.DB.QueryRow(`SELECT is_used FROM invites WHERE code = ?`, code).Scan(&isUsed)
-	if err == sql.ErrNoRows {
-		http.Error(w, `{"error": "Invite didn't found"}`, http.StatusNotFound)
-		return
-	} else if err != nil {
-		http.Error(w, `{"error": "DB Error"}`, http.StatusInternalServerError)
+	isUsed, err := h.Repo.IsInviteUsed(code)
+	if err != nil {
+		utils.SendError(w, http.StatusNotFound, "Invite not found or DB Error")
 		return
 	}
 
 	if isUsed {
-		http.Error(w, `{"error": "Invite already used"}`, http.StatusConflict)
+		utils.SendError(w, http.StatusConflict, "Invite already used")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status": "valid"}`))
+	utils.SendJSON(w, http.StatusOK, map[string]string{"status": "valid"})
 }
 
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
@@ -143,31 +152,19 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := h.DB.Begin()
-	if err != nil {
-		utils.SendError(w, http.StatusInternalServerError, "Internal server error")
-		return
+	user := models.User{
+		ID:                  req.ID,
+		Username:            req.Username,
+		PasswordHash:        string(hashedToken),
+		PublicKey:           req.PublicKey,
+		EncryptedPrivateKey: req.EncryptedPrivateKey,
 	}
-	defer tx.Rollback()
 
-	res, err := tx.Exec(`UPDATE invites SET is_used = TRUE WHERE code = ? AND is_used = FALSE`, req.InviteCode)
-	if err != nil {
-		utils.SendError(w, http.StatusInternalServerError, "DB Error while Invite check")
-		return
-	}
-	if rowsAffected, _ := res.RowsAffected(); rowsAffected == 0 {
-		utils.SendError(w, http.StatusForbidden, "Invite is invalid or already used")
+	if err := h.Repo.RegisterUserWithInvite(user, req.InviteCode, req.Avatar); err != nil {
+		utils.SendError(w, http.StatusConflict, "Invalid invite, or username already exists")
 		return
 	}
 
-	query := `INSERT INTO users (id, username, password_hash, public_key, encrypted_private_key, avatar) VALUES (?, ?, ?, ?, ?, ?)`
-	_, err = tx.Exec(query, req.ID, req.Username, string(hashedToken), req.PublicKey, req.EncryptedPrivateKey, req.Avatar)
-	if err != nil {
-		utils.SendError(w, http.StatusConflict, "Пользователь с таким именем уже существует")
-		return
-	}
-
-	tx.Commit()
 	utils.SendJSON(w, http.StatusCreated, map[string]string{"status": "success"})
 }
 
@@ -183,14 +180,9 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var u models.User
-	query := `SELECT id, username, password_hash, public_key, encrypted_private_key FROM users WHERE username = ?`
-	err := h.DB.QueryRow(query, req.Username).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.PublicKey, &u.EncryptedPrivateKey)
-	if err == sql.ErrNoRows {
+	u, err := h.Repo.GetUserByUsername(req.Username)
+	if err != nil {
 		utils.SendError(w, http.StatusUnauthorized, "Invalid Username or Password")
-		return
-	} else if err != nil {
-		utils.SendError(w, http.StatusInternalServerError, "Database error")
 		return
 	}
 
@@ -212,105 +204,101 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-type ChangePasswordRequest struct {
-	OldPassword         string `json:"old_password"`
-	NewPassword         string `json:"new_password"`
-	EncryptedPrivateKey string `json:"encrypted_private_key"`
-}
-
 func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
+	if !utils.CheckMethod(w, r, http.MethodPut) {
 		return
 	}
 
-	userID, ok := r.Context().Value(middleware.UserIDKey).(string)
+	userID, ok := utils.GetUserID(w, r)
 	if !ok {
-		http.Error(w, `{"error": "Error auth"}`, http.StatusInternalServerError)
 		return
 	}
 
 	var req ChangePasswordRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "invalid JSON format"}`, http.StatusBadRequest)
+	if !utils.DecodeJSON(w, r, &req) {
 		return
 	}
 
 	if err := utils.ValidatePassword(req.NewPassword); err != nil {
-		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusBadRequest)
+		utils.SendError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	var currentHash string
-	err := h.DB.QueryRow(`SELECT password_hash FROM users WHERE id = ?`, userID).Scan(&currentHash)
+	currentHash, err := h.Repo.GetPasswordHash(userID)
 	if err != nil {
-		http.Error(w, `{"error": "User not found"}`, http.StatusNotFound)
+		utils.SendError(w, http.StatusNotFound, "User not found")
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(currentHash), []byte(req.OldPassword)); err != nil {
-		http.Error(w, `{"error": "Incorrect old password"}`, http.StatusUnauthorized)
+		utils.SendError(w, http.StatusUnauthorized, "Incorrect old password")
 		return
 	}
 
 	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
-		http.Error(w, `{"error": "Internal error"}`, http.StatusInternalServerError)
+		utils.SendError(w, http.StatusInternalServerError, "Internal error")
 		return
 	}
 
-	query := `UPDATE users SET password_hash = ?, encrypted_private_key = ? WHERE id = ?`
-	_, err = h.DB.Exec(query, string(newHash), req.EncryptedPrivateKey, userID)
-	if err != nil {
-		http.Error(w, `{"error": "Update password error"}`, http.StatusInternalServerError)
+	if err := h.Repo.UpdatePassword(userID, string(newHash), req.EncryptedPrivateKey); err != nil {
+		utils.SendError(w, http.StatusInternalServerError, "Update password error")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	utils.SendJSON(w, http.StatusOK, map[string]string{
 		"status":  "success",
 		"message": "Password changed successfully",
 	})
 }
 
-type SearchUserResponse struct {
-	ID        string `json:"id"`
-	Username  string `json:"username"`
-	PublicKey string `json:"public_key"`
-	Avatar    string `json:"avatar"`
-}
-
 func (h *AuthHandler) SearchUser(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if !utils.CheckMethod(w, r, http.MethodGet) {
 		return
 	}
 
 	username := r.URL.Query().Get("username")
 	if username == "" {
-		http.Error(w, "username is required", http.StatusBadRequest)
+		utils.SendError(w, http.StatusBadRequest, "username is required")
 		return
 	}
 
-	var user SearchUserResponse
-
-	query := `
-        SELECT id, username, public_key, avatar FROM users 
-        WHERE username = ? 
-        AND username NOT LIKE '\_%' 
-        AND username NOT LIKE '%_bot'
-    `
-
-	err := h.DB.QueryRow(query, username).Scan(&user.ID, &user.Username, &user.PublicKey, &user.Avatar)
-
-	if err == sql.ErrNoRows {
-		http.Error(w, "Пользователь не найден", http.StatusNotFound)
-		return
-	} else if err != nil {
-		http.Error(w, "Ошибка базы данных", http.StatusInternalServerError)
+	user, err := h.Repo.SearchUser(username)
+	if err != nil {
+		utils.SendError(w, http.StatusNotFound, "User not found")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(user)
+	utils.SendJSON(w, http.StatusOK, user)
+}
+
+func (h *AuthHandler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
+	if !utils.CheckMethod(w, r, http.MethodDelete) {
+		return
+	}
+
+	userID, ok := utils.GetUserID(w, r)
+	if !ok {
+		return
+	}
+
+	avatarFileName, err := h.Repo.DeleteUser(userID)
+	if err != nil {
+		utils.SendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if avatarFileName != "" {
+		uploadDir := "uploads"
+		fullPath := filepath.Join(uploadDir, avatarFileName)
+
+		if err := os.Remove(fullPath); err != nil {
+			slog.Error("Failed to delete avatar file from disk", "path", fullPath, "error", err)
+		}
+	}
+
+	utils.SendJSON(w, http.StatusOK, map[string]string{
+		"status":  "success",
+		"message": "Account and avatar deleted successfully",
+	})
 }

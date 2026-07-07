@@ -17,7 +17,7 @@ func InitDB(filepath string) (*sql.DB, error) {
 		return nil, err
 	}
 
-	_, err = db.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")
+	_, err = db.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")
 	if err != nil {
 		slog.Error("Failed to configure SQLite PRAGMA", "error", err)
 		return nil, err
@@ -45,7 +45,10 @@ func createTables(db *sql.DB) error {
 		password_hash TEXT NOT NULL,
 		public_key TEXT NOT NULL,
 		encrypted_private_key TEXT NOT NULL,
-		avatar TEXT
+		avatar TEXT,
+		status TEXT DEFAULT 'active',
+		ban_expires_at INTEGER DEFAULT 0,
+		ban_reason TEXT
 	);
 
 	CREATE TABLE IF NOT EXISTS chats (
@@ -67,11 +70,14 @@ func createTables(db *sql.DB) error {
 		sender_id TEXT NOT NULL,
 		sender_type TEXT,
 		chat_type TEXT,
-		timestamp INTEGER,
+		timestamp INTEGER NOT NULL,
 		content TEXT NOT NULL,
 		iv TEXT NOT NULL,
 		file_id TEXT
 	);
+
+	CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, timestamp DESC);
+	CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
 
 	CREATE TABLE IF NOT EXISTS message_statuses (
 		message_id TEXT NOT NULL,
@@ -83,8 +89,5 @@ func createTables(db *sql.DB) error {
 	);
 	`
 	_, err := db.Exec(query)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }

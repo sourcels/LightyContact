@@ -2,9 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"database/sql"
-	"encoding/hex"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,65 +14,10 @@ import (
 	"github.com/sourcels/LightyContact/internal/db"
 	"github.com/sourcels/LightyContact/internal/handlers"
 	"github.com/sourcels/LightyContact/internal/middleware"
+	"github.com/sourcels/LightyContact/internal/repository"
+	"github.com/sourcels/LightyContact/internal/utils"
 	"github.com/sourcels/LightyContact/internal/ws"
-	"golang.org/x/crypto/bcrypt"
 )
-
-func InitRootUser(db *sql.DB, envPassword string) {
-	rootID := "_root"
-
-	var dbHash string
-	err := db.QueryRow("SELECT password_hash FROM users WHERE id = ?", rootID).Scan(&dbHash)
-	rootExists := (err != sql.ErrNoRows)
-
-	var passwordToSet string
-	needUpdateHash := false
-
-	if envPassword != "" {
-		passwordToSet = envPassword
-		if !rootExists || bcrypt.CompareHashAndPassword([]byte(dbHash), []byte(envPassword)) != nil {
-			needUpdateHash = true
-		}
-	} else {
-		if rootExists {
-			slog.Info("Root user loaded using database password")
-		} else {
-			// 3. Нет ни в .env, ни в БД -> генерируем!
-			bytes := make([]byte, 8)
-			rand.Read(bytes)
-			passwordToSet = hex.EncodeToString(bytes)
-			needUpdateHash = true
-
-			slog.Warn("==================================================")
-			slog.Warn("INITIALIZING _root ACCOUNT FOR THE FIRST TIME!")
-			slog.Warn("AUTO-GENERATED PASSWORD: " + passwordToSet)
-			slog.Warn("Please save this password or add it to .env (ROOT_PASSWORD)")
-			slog.Warn("==================================================")
-		}
-	}
-
-	if needUpdateHash {
-		hashed, _ := bcrypt.GenerateFromPassword([]byte(passwordToSet), bcrypt.DefaultCost)
-
-		if !rootExists {
-			_, err = db.Exec(`
-				INSERT INTO users (id, username, password_hash, public_key, encrypted_private_key, avatar) 
-				VALUES (?, ?, ?, ?, ?, ?)`,
-				rootID, "_root", string(hashed), "root_pub", "root_priv", "",
-			)
-			if err != nil {
-				slog.Error("Failed to create _root user", "error", err)
-			}
-		} else {
-			_, err = db.Exec("UPDATE users SET password_hash = ? WHERE id = ?", string(hashed), rootID)
-			if err != nil {
-				slog.Error("Failed to update _root password", "error", err)
-			} else {
-				slog.Info("Root user password synchronized with .env")
-			}
-		}
-	}
-}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -100,38 +42,32 @@ func main() {
 		slog.Error("Critical database error", "error", err)
 		os.Exit(1)
 	}
-
 	slog.Info("Successfully connected to SQLite. Tables are ready.")
 
-	authHandler := &handlers.AuthHandler{DB: database}
-	chatHandler := &handlers.ChatHandler{DB: database}
+	db.InitRootUser(database, cfg.RootPassword)
+
+	uploadDir := "./uploads"
+	os.MkdirAll(uploadDir, os.ModePerm)
+	utils.StartFileGC(database, uploadDir, 12*time.Hour)
+
+	authRepo := repository.NewAuthRepo(database)
+	chatRepo := repository.NewChatRepo(database)
+
+	authHandler := &handlers.AuthHandler{Repo: authRepo}
+	chatHandler := &handlers.ChatHandler{Repo: chatRepo}
 
 	hub := ws.NewHub(database)
 	go hub.Run()
 
-	corsMiddleware := middleware.EnableCORS(cfg.AllowedOrigin)
+	mux := handlers.ConfigureRouter(authHandler, chatHandler, hub)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/invites/generate", corsMiddleware(middleware.RequireAuth(authHandler.GenerateInvite)))
-	mux.HandleFunc("/api/invites/verify", corsMiddleware(authHandler.VerifyInvite)) // Без авторизации!
-	mux.HandleFunc("/api/register", corsMiddleware(authHandler.Register))
-	mux.HandleFunc("/api/login", corsMiddleware(authHandler.Login))
-	mux.HandleFunc("/api/user/password", corsMiddleware(middleware.RequireAuth(authHandler.ChangePassword)))
-	mux.HandleFunc("/api/chat/create", corsMiddleware(middleware.RequireAuth(chatHandler.CreateChat)))
-	mux.HandleFunc("/api/chat/history", corsMiddleware(middleware.RequireAuth(chatHandler.GetHistory)))
-	mux.HandleFunc("/api/user/chats", corsMiddleware(middleware.RequireAuth(chatHandler.GetUserChats)))
-	mux.HandleFunc("/api/files/upload", corsMiddleware(middleware.RequireAuth(chatHandler.UploadFile)))
-	mux.HandleFunc("/api/files/download", corsMiddleware(middleware.RequireAuth(chatHandler.DownloadFile)))
-	mux.HandleFunc("/api/chat/statuses", corsMiddleware(middleware.RequireAuth(chatHandler.GetChatStatuses)))
-	mux.HandleFunc("/api/user/search", corsMiddleware(middleware.RequireAuth(authHandler.SearchUser)))
-	mux.HandleFunc("/ws", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		ws.ServeWS(hub, w, r)
-	}))
+	corsMiddleware := middleware.EnableCORS(cfg.AllowedOrigin)
+	globalHandlerWithCORS := corsMiddleware(http.HandlerFunc(mux.ServeHTTP))
 
 	address := ":" + cfg.Port
 	srv := &http.Server{
 		Addr:    address,
-		Handler: mux,
+		Handler: globalHandlerWithCORS, // Используем обертку CORS для всех запросов
 	}
 
 	go func() {
