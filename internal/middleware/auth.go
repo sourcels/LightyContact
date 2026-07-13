@@ -6,13 +6,14 @@ import (
 	"strings"
 
 	"github.com/sourcels/LightyContact/internal/auth"
+	"github.com/sourcels/LightyContact/internal/repository"
 )
 
 type contextKey string
 
 const UserIDKey contextKey = "userID"
 
-func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
+func RequireAuth(authRepo *repository.AuthRepo, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
@@ -34,8 +35,17 @@ func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), UserIDKey, userID)
+		isBanned, reason, err := authRepo.CheckUserBanStatus(userID)
+		if err != nil {
+			http.Error(w, "Internal server error checking account status", http.StatusInternalServerError)
+			return
+		}
+		if isBanned {
+			http.Error(w, "Your account is banned. Reason: "+reason, http.StatusForbidden)
+			return
+		}
 
+		ctx := context.WithValue(r.Context(), UserIDKey, userID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	}
 }

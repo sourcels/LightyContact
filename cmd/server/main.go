@@ -44,7 +44,7 @@ func main() {
 	}
 	slog.Info("Successfully connected to SQLite. Tables are ready.")
 
-	db.InitRootUser(database, cfg.RootPassword)
+	db.EnsureInitialInvite(database)
 
 	uploadDir := "./uploads"
 	os.MkdirAll(uploadDir, os.ModePerm)

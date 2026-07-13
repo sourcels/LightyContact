@@ -11,6 +11,7 @@ type User struct {
 	PublicKey           string `json:"public_key"`
 	EncryptedPrivateKey string `json:"encrypted_private_key"`
 	Avatar              string `json:"avatar"`
+	Role                string `json:"role"`
 }
 
 type Chat struct {

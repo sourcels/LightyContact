@@ -35,13 +35,24 @@ const maxMessageSize = 8192
 func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	tokenString := r.URL.Query().Get("token")
 	if tokenString == "" {
-		http.Error(w, "Отсутствует токен авторизации", http.StatusUnauthorized)
+		http.Error(w, "No auth token provided", http.StatusUnauthorized)
 		return
 	}
 
 	userID, err := auth.ValidateToken(tokenString)
 	if err != nil {
-		http.Error(w, "Невалидный токен: "+err.Error(), http.StatusUnauthorized)
+		http.Error(w, "Invalid token: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	var status string
+	err = hub.DB.QueryRow("SELECT status FROM users WHERE id = ?", userID).Scan(&status)
+	if err != nil {
+		http.Error(w, "DB Error", http.StatusInternalServerError)
+		return
+	}
+	if status == "banned" {
+		http.Error(w, "Access denied: ban", http.StatusForbidden)
 		return
 	}
 

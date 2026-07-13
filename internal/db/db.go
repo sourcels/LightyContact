@@ -47,6 +47,7 @@ func createTables(db *sql.DB) error {
 		encrypted_private_key TEXT NOT NULL,
 		avatar TEXT,
 		status TEXT DEFAULT 'active',
+		role TEXT DEFAULT 'user',
 		ban_expires_at INTEGER DEFAULT 0,
 		ban_reason TEXT
 	);

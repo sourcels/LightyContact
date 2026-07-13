@@ -3,6 +3,7 @@ package handlers
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/sourcels/LightyContact/internal/models"
 	"github.com/sourcels/LightyContact/internal/repository"
 	"github.com/sourcels/LightyContact/internal/utils"
+	"github.com/sourcels/LightyContact/internal/ws"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -39,18 +41,13 @@ type LoginResponse struct {
 	SessionToken        string `json:"session_token"`
 	PublicKey           string `json:"public_key"`
 	EncryptedPrivateKey string `json:"encrypted_private_key"`
+	Role                string `json:"role"`
 }
 
 type ChangePasswordRequest struct {
 	OldPassword         string `json:"old_password"`
 	NewPassword         string `json:"new_password"`
 	EncryptedPrivateKey string `json:"encrypted_private_key"`
-}
-
-func generateInviteCode() string {
-	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
 }
 
 func (h *AuthHandler) GenerateInvite(w http.ResponseWriter, r *http.Request) {
@@ -63,14 +60,23 @@ func (h *AuthHandler) GenerateInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	count, err := h.Repo.GetInviteCountLastWeek(userID)
+	role, err := h.Repo.GetUserRole(userID)
 	if err != nil {
-		utils.SendError(w, http.StatusInternalServerError, "Database error checking limits")
+		utils.SendError(w, http.StatusInternalServerError, "Failed to verify user role")
 		return
 	}
-	if count >= 10 {
-		utils.SendError(w, http.StatusTooManyRequests, "Weekly invite limit reached (max 10 per week)")
-		return
+
+	if role != "admin" {
+		count, err := h.Repo.GetInviteCountLastWeek(userID)
+		if err != nil {
+			utils.SendError(w, http.StatusInternalServerError, "Database error checking limits")
+			return
+		}
+
+		if count >= 1 {
+			utils.SendError(w, http.StatusTooManyRequests, "Weekly invite limit reached (max 1 per week)")
+			return
+		}
 	}
 
 	bytes := make([]byte, 16)
@@ -81,12 +87,14 @@ func (h *AuthHandler) GenerateInvite(w http.ResponseWriter, r *http.Request) {
 	code := hex.EncodeToString(bytes)
 	timestamp := time.Now().Unix()
 
-	if err := h.Repo.CreateInvite(code, userID, timestamp); err != nil {
-		utils.SendError(w, http.StatusInternalServerError, "Error creating invite")
+	err = h.Repo.CreateInvite(code, userID, timestamp)
+	if err != nil {
+		utils.SendError(w, http.StatusInternalServerError, "Failed to generate invite code")
 		return
 	}
 
 	utils.SendJSON(w, http.StatusCreated, map[string]string{
+		"status":      "success",
 		"invite_code": code,
 	})
 }
@@ -191,6 +199,8 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	role, _ := h.Repo.GetUserRole(u.ID)
+
 	sessionToken, err := auth.GenerateToken(u.ID)
 	if err != nil {
 		utils.SendError(w, http.StatusInternalServerError, "Error token generation")
@@ -201,6 +211,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		SessionToken:        sessionToken,
 		PublicKey:           u.PublicKey,
 		EncryptedPrivateKey: u.EncryptedPrivateKey,
+		Role:                role,
 	})
 }
 
@@ -300,5 +311,90 @@ func (h *AuthHandler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
 	utils.SendJSON(w, http.StatusOK, map[string]string{
 		"status":  "success",
 		"message": "Account and avatar deleted successfully",
+	})
+}
+
+type BanUserRequest struct {
+	UserID   string `json:"user_id"`
+	Duration int64  `json:"duration_seconds"`
+	Reason   string `json:"reason"`
+}
+
+type UnbanUserRequest struct {
+	UserID string `json:"user_id"`
+}
+
+func (h *AuthHandler) BanUser(hub *ws.Hub, w http.ResponseWriter, r *http.Request) {
+	if !utils.CheckMethod(w, r, http.MethodPost) {
+		return
+	}
+
+	currentUserID, ok := utils.GetUserID(w, r)
+	if !ok {
+		return
+	}
+
+	role, err := h.Repo.GetUserRole(currentUserID)
+	if err != nil || role != "admin" {
+		utils.SendError(w, http.StatusForbidden, "Only admin can ban users")
+		return
+	}
+
+	var req BanUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.SendError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.UserID == "" {
+		utils.SendError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	err = h.Repo.BanUser(req.UserID, req.Duration, req.Reason)
+	if err != nil {
+		utils.SendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	utils.SendJSON(w, http.StatusOK, map[string]string{
+		"status":  "success",
+		"message": "User has been banned successfully",
+	})
+
+	hub.Disconnect <- req.UserID
+}
+
+func (h *AuthHandler) UnbanUser(w http.ResponseWriter, r *http.Request) {
+	if !utils.CheckMethod(w, r, http.MethodPost) {
+		return
+	}
+
+	currentUserID, ok := utils.GetUserID(w, r)
+	if !ok {
+		return
+	}
+
+	role, err := h.Repo.GetUserRole(currentUserID)
+	if err != nil || role != "admin" {
+		utils.SendError(w, http.StatusForbidden, "Only admin can unban users")
+		return
+	}
+
+	var req UnbanUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.SendError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	err = h.Repo.UnbanUser(req.UserID)
+	if err != nil {
+		utils.SendError(w, http.StatusInternalServerError, "Failed to unban user")
+		return
+	}
+
+	utils.SendJSON(w, http.StatusOK, map[string]string{
+		"status":  "success",
+		"message": "User has been unbanned successfully",
 	})
 }

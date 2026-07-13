@@ -27,6 +27,7 @@ type Hub struct {
 	Dispatch   chan *DispatchMessage
 	Register   chan *Client
 	Unregister chan *Client
+	Disconnect chan string
 }
 
 func NewHub(db *sql.DB) *Hub {
@@ -36,6 +37,7 @@ func NewHub(db *sql.DB) *Hub {
 		Dispatch:   make(chan *DispatchMessage),
 		Register:   make(chan *Client),
 		Unregister: make(chan *Client),
+		Disconnect: make(chan string),
 		Clients:    make(map[string]map[*Client]bool),
 	}
 }
@@ -94,6 +96,15 @@ func (h *Hub) Run() {
 						slog.Info("User disconnected", "user_id", client.UserID)
 					}
 				}
+			}
+
+		case userID := <-h.Disconnect:
+			if connections, ok := h.Clients[userID]; ok {
+				for client := range connections {
+					sendWSError(client, "account_banned")
+					close(client.Send)
+				}
+				slog.Info("Force disconnected banned user from WebSockets", "user_id", userID)
 			}
 
 		case cMsg := <-h.Broadcast:

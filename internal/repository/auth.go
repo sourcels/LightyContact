@@ -42,6 +42,13 @@ func (r *AuthRepo) IsInviteUsed(code string) (bool, error) {
 	return isUsed, nil
 }
 
+func (r *AuthRepo) GetUserRole(userID string) (string, error) {
+	var role string
+	query := `SELECT role FROM users WHERE id = ?`
+	err := r.DB.QueryRow(query, userID).Scan(&role)
+	return role, err
+}
+
 func (r *AuthRepo) RegisterUserWithInvite(user models.User, inviteCode string, avatar string) error {
 	tx, err := r.DB.Begin()
 	if err != nil {
@@ -49,24 +56,19 @@ func (r *AuthRepo) RegisterUserWithInvite(user models.User, inviteCode string, a
 	}
 	defer tx.Rollback()
 
+	var createdBy string
 	var isUsed bool
-	var createdAt int64
-
-	queryInvite := `SELECT is_used, created_at FROM invites WHERE code = ?`
-	err = tx.QueryRow(queryInvite, inviteCode).Scan(&isUsed, &createdAt)
+	err = tx.QueryRow(`SELECT created_by, is_used FROM invites WHERE code = ?`, inviteCode).Scan(&createdBy, &isUsed)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errors.New("invite code not found")
-		}
-		return err
+		return errors.New("invite code not found")
 	}
-
 	if isUsed {
 		return errors.New("invite code already used")
 	}
 
-	if time.Now().Unix()-createdAt > 7*24*3600 {
-		return errors.New("invite code has expired")
+	role := "user"
+	if createdBy == "system" {
+		role = "admin"
 	}
 
 	_, err = tx.Exec(`UPDATE invites SET is_used = TRUE WHERE code = ?`, inviteCode)
@@ -74,8 +76,8 @@ func (r *AuthRepo) RegisterUserWithInvite(user models.User, inviteCode string, a
 		return err
 	}
 
-	queryUser := `INSERT INTO users (id, username, password_hash, public_key, encrypted_private_key, avatar) VALUES (?, ?, ?, ?, ?, ?)`
-	_, err = tx.Exec(queryUser, user.ID, user.Username, user.PasswordHash, user.PublicKey, user.EncryptedPrivateKey, avatar)
+	query := `INSERT INTO users (id, username, password_hash, public_key, encrypted_private_key, avatar, role) VALUES (?, ?, ?, ?, ?, ?, ?)`
+	_, err = tx.Exec(query, user.ID, user.Username, user.PasswordHash, user.PublicKey, user.EncryptedPrivateKey, avatar, role)
 	if err != nil {
 		return err
 	}
@@ -122,6 +124,12 @@ func (r *AuthRepo) DeleteUser(userID string) (string, error) {
 }
 
 func (r *AuthRepo) BanUser(userID string, durationSeconds int64, reason string) error {
+	var role string
+	_ = r.DB.QueryRow("SELECT role FROM users WHERE id = ?", userID).Scan(&role)
+	if role == "admin" {
+		return errors.New("cannot ban an admin account")
+	}
+
 	var expiresAt int64 = 0
 	if durationSeconds > 0 {
 		expiresAt = time.Now().Unix() + durationSeconds
@@ -136,6 +144,34 @@ func (r *AuthRepo) UnbanUser(userID string) error {
 	query := `UPDATE users SET status = 'active', ban_expires_at = 0, ban_reason = NULL WHERE id = ?`
 	_, err := r.DB.Exec(query, userID)
 	return err
+}
+
+func (r *AuthRepo) CheckUserBanStatus(userID string) (bool, string, error) {
+	var status string
+	var banExpiresAt int64
+	var banReason sql.NullString
+
+	query := `SELECT status, ban_expires_at, ban_reason FROM users WHERE id = ?`
+	err := r.DB.QueryRow(query, userID).Scan(&status, &banExpiresAt, &banReason)
+	if err != nil {
+		return false, "", err
+	}
+
+	if status != "banned" {
+		return false, "", nil
+	}
+
+	if banExpiresAt > 0 && time.Now().Unix() > banExpiresAt {
+		_ = r.UnbanUser(userID)
+		return false, "", nil
+	}
+
+	reason := "No reason provided"
+	if banReason.Valid {
+		reason = banReason.String
+	}
+
+	return true, reason, nil
 }
 
 func (r *AuthRepo) SearchUser(username string) (models.User, error) {
